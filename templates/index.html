@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LocalScan – Malware Analysis Sandbox</title>
+<style>
+  :root {
+    --bg:       #0d0f14;
+    --surface:  #161a23;
+    --card:     #1e2333;
+    --border:   #2a3050;
+    --accent:   #4f8ef7;
+    --accent2:  #7c5cbf;
+    --text:     #c8d0e8;
+    --muted:    #5a6480;
+    --green:    #2ecc71;
+    --yellow:   #f1c40f;
+    --orange:   #e67e22;
+    --red:      #e74c3c;
+    --critical: #c0392b;
+    --radius:   10px;
+    --font:     'Segoe UI', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+         font-size: 14px; line-height: 1.6; min-height: 100vh; }
+
+  /* ── layout ── */
+  header { background: var(--surface); border-bottom: 1px solid var(--border);
+           padding: 0 2rem; display: flex; align-items: center; height: 56px;
+           position: sticky; top: 0; z-index: 100; }
+  .logo  { font-size: 1.2rem; font-weight: 700; color: #fff;
+           display: flex; align-items: center; gap: .5rem; }
+  .logo span { color: var(--accent); }
+  .nav-tabs { display: flex; gap: 0; margin-left: 2rem; }
+  .nav-tab  { padding: 0 1.1rem; height: 56px; display: flex; align-items: center;
+              cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
+              font-weight: 500; transition: .15s; }
+  .nav-tab:hover  { color: var(--text); }
+  .nav-tab.active { color: var(--accent); border-color: var(--accent); }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ── upload panel ── */
+  .upload-panel { background: var(--surface); border: 1px solid var(--border);
+                  border-radius: var(--radius); padding: 2rem; margin-bottom: 1.5rem; }
+  .dropzone { border: 2px dashed var(--border); border-radius: var(--radius);
+              padding: 3rem 2rem; text-align: center; cursor: pointer;
+              transition: .2s; position: relative; }
+  .dropzone.drag-over { border-color: var(--accent); background: rgba(79,142,247,.06); }
+  .dropzone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .dropzone .icon { font-size: 2.5rem; margin-bottom: .5rem; }
+  .dropzone .hint { color: var(--muted); font-size: .9rem; margin-top: .4rem; }
+  .file-preview { display: none; align-items: center; gap: 1rem; padding: 1rem;
+                  background: var(--card); border-radius: 8px; margin-top: 1rem; }
+  .file-preview.shown { display: flex; }
+  .file-icon { font-size: 2rem; }
+  .file-name { font-weight: 600; word-break: break-all; }
+  .file-size { color: var(--muted); font-size: .85rem; }
+
+  .controls { display: flex; gap: 1.5rem; align-items: flex-end; flex-wrap: wrap;
+              margin-top: 1.5rem; }
+  .field     { display: flex; flex-direction: column; gap: .4rem; flex: 1; min-width: 200px; }
+  .field label { font-size: .8rem; color: var(--muted); font-weight: 600; text-transform: uppercase;
+                 letter-spacing: .05em; }
+  .duration-row { display: flex; align-items: center; gap: 1rem; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .duration-val { background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+                  padding: .3rem .8rem; font-weight: 700; color: var(--accent); min-width: 60px;
+                  text-align: center; }
+  .btn { padding: .65rem 1.8rem; border-radius: 8px; border: none; font-size: .95rem;
+         font-weight: 600; cursor: pointer; transition: .15s; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #3a7be0; }
+  .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-danger { background: transparent; border: 1px solid var(--red); color: var(--red); padding: .3rem .8rem; font-size: .8rem; }
+
+  /* ── status banner ── */
+  .status-bar { display: none; align-items: center; gap: 1rem; padding: 1rem 1.5rem;
+                background: var(--card); border: 1px solid var(--border);
+                border-radius: var(--radius); margin-bottom: 1.5rem; }
+  .status-bar.shown { display: flex; }
+  .spinner { width: 18px; height: 18px; border: 2.5px solid var(--border);
+             border-top-color: var(--accent); border-radius: 50%;
+             animation: spin .7s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status-text { flex: 1; }
+  .status-label { font-weight: 700; }
+  .status-detail { color: var(--muted); font-size: .85rem; }
+  .progress-bar { height: 3px; background: var(--border); border-radius: 2px;
+                  margin-top: .4rem; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent);
+                   transition: width .4s; border-radius: 2px; }
+
+  /* ── results ── */
+  .results { display: none; }
+  .results.shown { display: block; }
+  .section { background: var(--surface); border: 1px solid var(--border);
+             border-radius: var(--radius); margin-bottom: 1.2rem; overflow: hidden; }
+  .section-header { padding: .8rem 1.3rem; background: var(--card);
+                    border-bottom: 1px solid var(--border);
+                    display: flex; align-items: center; gap: .6rem;
+                    font-weight: 700; font-size: .9rem; text-transform: uppercase;
+                    letter-spacing: .06em; color: var(--muted); cursor: pointer; }
+  .section-header .toggle { margin-left: auto; color: var(--muted); transition: .2s; }
+  .section-header.collapsed .toggle { transform: rotate(-90deg); }
+  .section-body { padding: 1.2rem 1.3rem; }
+  .section-body.collapsed { display: none; }
+
+  /* verdict / risk ── */
+  .verdict-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 600px) { .verdict-grid { grid-template-columns: 1fr; } }
+
+  .verdict-box { background: var(--card); border-radius: 8px; padding: 1.2rem; text-align: center; }
+  .verdict-box .vb-label { font-size: .75rem; color: var(--muted); text-transform: uppercase;
+                            letter-spacing: .08em; font-weight: 600; }
+  .verdict-box .vb-value { font-size: 1.5rem; font-weight: 800; margin-top: .3rem; }
+  .verdict-box .vb-sub   { font-size: .8rem; color: var(--muted); margin-top: .2rem; }
+
+  .badge { display: inline-block; padding: .25rem .75rem; border-radius: 20px;
+           font-size: .8rem; font-weight: 700; text-transform: uppercase; }
+  .badge-clean    { background: rgba(46,204,113,.15); color: var(--green); border: 1px solid rgba(46,204,113,.3); }
+  .badge-threat   { background: rgba(231,76,60,.15);  color: var(--red);   border: 1px solid rgba(231,76,60,.3); }
+  .badge-error    { background: rgba(241,196,15,.12); color: var(--yellow); border: 1px solid rgba(241,196,15,.3); }
+  .badge-low      { background: rgba(46,204,113,.12); color: var(--green); border: 1px solid rgba(46,204,113,.3); }
+  .badge-medium   { background: rgba(241,196,15,.12); color: var(--yellow); border: 1px solid rgba(241,196,15,.3); }
+  .badge-high     { background: rgba(230,126,34,.15); color: var(--orange); border: 1px solid rgba(230,126,34,.3); }
+  .badge-critical { background: rgba(192,57,43,.2);   color: var(--critical); border: 1px solid rgba(192,57,43,.4); }
+
+  .risk-gauge { position: relative; display: inline-block; width: 100px; height: 60px; margin: .5rem auto; }
+  .risk-bar   { height: 10px; border-radius: 5px; background: var(--border); overflow: hidden; margin: .6rem 0; }
+  .risk-fill  { height: 100%; border-radius: 5px; transition: width .8s ease; }
+
+  /* hash grid ── */
+  .hash-grid { display: grid; gap: .5rem; }
+  .hash-row  { display: grid; grid-template-columns: 60px 1fr; gap: .8rem; align-items: center; }
+  .hash-key  { font-size: .7rem; text-transform: uppercase; font-weight: 700;
+               color: var(--muted); letter-spacing: .06em; }
+  .hash-val  { font-family: 'Consolas', monospace; font-size: .8rem; color: var(--text);
+               word-break: break-all; }
+  .copy-btn  { background: none; border: none; color: var(--muted); cursor: pointer;
+               padding: 0 .3rem; font-size: .9rem; }
+  .copy-btn:hover { color: var(--accent); }
+
+  /* table ── */
+  .tbl { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  .tbl th { color: var(--muted); font-size: .75rem; text-transform: uppercase;
+            letter-spacing: .06em; padding: .5rem .8rem; text-align: left;
+            border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .tbl td { padding: .5rem .8rem; border-bottom: 1px solid rgba(42,48,80,.5);
+            vertical-align: top; }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl tr:hover td { background: rgba(79,142,247,.04); }
+  .mono { font-family: 'Consolas', monospace; font-size: .8rem; }
+  .pid  { background: var(--card); border-radius: 4px; padding: .1rem .4rem;
+          font-family: monospace; font-size: .75rem; }
+  .proc-name { font-weight: 600; }
+  .proc-susp { color: var(--orange); }
+
+  /* timeline ── */
+  .timeline { display: flex; flex-direction: column; gap: .5rem; }
+  .tl-item  { display: grid; grid-template-columns: 55px 110px 1fr;
+              gap: .6rem; align-items: baseline; font-size: .83rem; }
+  .tl-time  { color: var(--muted); font-family: monospace; text-align: right;
+              font-size: .75rem; }
+  .tl-type  { font-weight: 700; font-size: .72rem; text-transform: uppercase;
+              letter-spacing: .04em; padding: .1rem .5rem; border-radius: 4px;
+              text-align: center; }
+  .tl-exec  { background: rgba(124,92,191,.18); color: var(--accent2); }
+  .tl-proc  { background: rgba(230,126,34,.15); color: var(--orange); }
+  .tl-net   { background: rgba(79,142,247,.15);  color: var(--accent); }
+  .tl-def   { background: rgba(231,76,60,.15);   color: var(--red); }
+  .tl-kill  { background: rgba(90,100,128,.2);   color: var(--muted); }
+  .tl-exit  { background: rgba(46,204,113,.12);  color: var(--green); }
+  .tl-other { background: rgba(90,100,128,.15);  color: var(--muted); }
+  .tl-data  { font-family: 'Consolas', monospace; word-break: break-all; }
+
+  /* raw output ── */
+  .raw-box { background: #0a0c10; border: 1px solid var(--border); border-radius: 8px;
+             padding: 1rem; font-family: 'Consolas', monospace; font-size: .78rem;
+             white-space: pre-wrap; word-break: break-all; max-height: 300px;
+             overflow-y: auto; color: #8fa0c0; line-height: 1.55; }
+
+  /* history table ── */
+  .hist-row { cursor: pointer; transition: .1s; }
+  .hist-row:hover td { background: rgba(79,142,247,.06); }
+  .empty { text-align: center; color: var(--muted); padding: 2rem; }
+
+  /* alerts ── */
+  .alert-item { background: var(--card); border-left: 3px solid var(--red);
+                border-radius: 0 6px 6px 0; padding: .7rem 1rem; margin-bottom: .6rem;
+                font-size: .82rem; }
+  .alert-item pre { font-size: .75rem; color: var(--muted); margin-top: .4rem;
+                    white-space: pre-wrap; word-break: break-all; }
+  .risk-reasons { list-style: none; padding: 0; }
+  .risk-reasons li { padding: .3rem 0; padding-left: 1.4rem; position: relative; }
+  .risk-reasons li::before { content: "⚑"; position: absolute; left: 0;
+                              color: var(--orange); font-size: .8rem; }
+
+  /* scroll ── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">🔬 <span>Local</span>Scan</div>
+  <nav class="nav-tabs">
+    <div class="nav-tab active" data-view="scan">Analyze</div>
+    <div class="nav-tab" data-view="history">History</div>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ── ANALYZE VIEW ── -->
+  <div class="view active" id="view-scan">
+
+    <div class="upload-panel">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput">
+        <div class="icon">📂</div>
+        <div style="font-size:1rem;font-weight:600;">Drop file here or click to browse</div>
+        <div class="hint">Supports any file type · Max 64 MB</div>
+      </div>
+
+      <div class="file-preview" id="filePreview">
+        <div class="file-icon" id="previewIcon">📄</div>
+        <div>
+          <div class="file-name" id="previewName"></div>
+          <div class="file-size" id="previewSize"></div>
+        </div>
+        <button class="btn btn-ghost" style="margin-left:auto" onclick="clearFile()">✕ Clear</button>
+      </div>
+
+      <div class="controls">
+        <div class="field">
+          <label>Monitor Duration</label>
+          <div class="duration-row">
+            <input type="range" id="durationSlider" min="5" max="120" value="30" step="5">
+            <div class="duration-val" id="durationVal">30s</div>
+          </div>
+        </div>
+        <button class="btn btn-primary" id="submitBtn" onclick="submitFile()" disabled>
+          ▶ Analyze
+        </button>
+      </div>
+    </div>
+
+    <!-- status bar -->
+    <div class="status-bar" id="statusBar">
+      <div class="spinner" id="spinner"></div>
+      <div class="status-text">
+        <div class="status-label" id="statusLabel">Scanning…</div>
+        <div class="status-detail" id="statusDetail"></div>
+        <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:10%"></div></div>
+      </div>
+    </div>
+
+    <!-- results -->
+    <div class="results" id="resultsPanel">
+
+      <!-- Verdict summary -->
+      <div class="section">
+        <div class="section-header">📊 Summary</div>
+        <div class="section-body">
+          <div class="verdict-grid" id="verdictGrid"></div>
+        </div>
+      </div>
+
+      <!-- File info + hashes -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          🗂️ File Information
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="fileInfoBody"></div>
+        </div>
+      </div>
+
+      <!-- Defender verdict -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          🛡️ Windows Defender Scan
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="defenderBody"></div>
+        </div>
+      </div>
+
+      <!-- Risk score -->
+      <div class="section" id="riskSection">
+        <div class="section-header" onclick="toggleSection(this)">
+          ⚠️ Dynamic Analysis – Risk Assessment
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="riskBody"></div>
+        </div>
+      </div>
+
+      <!-- New processes -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          ⚙️ New Processes <span id="procCount" style="color:var(--muted);font-size:.8rem;font-weight:400;margin-left:.5rem"></span>
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="procsBody"></div>
+        </div>
+      </div>
+
+      <!-- Network -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          🌐 Network Connections <span id="netCount" style="color:var(--muted);font-size:.8rem;font-weight:400;margin-left:.5rem"></span>
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="networkBody"></div>
+        </div>
+      </div>
+
+      <!-- Defender alerts -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          🚨 Defender Alerts (Runtime) <span id="alertCount" style="color:var(--muted);font-size:.8rem;font-weight:400;margin-left:.5rem"></span>
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="alertsBody"></div>
+        </div>
+      </div>
+
+      <!-- Timeline -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          📋 Event Timeline
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body">
+          <div id="timelineBody"></div>
+        </div>
+      </div>
+
+      <!-- Raw Defender output -->
+      <div class="section">
+        <div class="section-header" onclick="toggleSection(this)">
+          🔍 Raw Defender Output
+          <span class="toggle">▾</span>
+        </div>
+        <div class="section-body collapsed">
+          <div class="raw-box" id="rawOutput"></div>
+        </div>
+      </div>
+
+    </div><!-- /results -->
+  </div><!-- /scan view -->
+
+
+  <!-- ── HISTORY VIEW ── -->
+  <div class="view" id="view-history">
+    <div class="section">
+      <div class="section-header" style="justify-content:space-between">
+        📁 Recent Analyses
+        <button class="btn btn-ghost" style="font-size:.8rem;padding:.3rem .9rem" onclick="loadHistory()">↻ Refresh</button>
+      </div>
+      <div class="section-body" style="padding:0">
+        <table class="tbl" id="historyTable">
+          <thead>
+            <tr>
+              <th>File</th><th>Submitted</th><th>Status</th>
+              <th>AV Verdict</th><th>Risk</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="historyBody">
+            <tr><td colspan="6" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────
+let currentFile = null;
+let pollTimer   = null;
+let currentJobId = null;
+
+const SUSPICIOUS = new Set([
+  'cmd.exe','powershell.exe','pwsh.exe','wscript.exe','cscript.exe',
+  'mshta.exe','rundll32.exe','regsvr32.exe','certutil.exe','bitsadmin.exe',
+  'wmic.exe','msiexec.exe','schtasks.exe','reg.exe','net.exe','netsh.exe',
+  'at.exe','sc.exe','bcdedit.exe'
+]);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Navigation
+// ─────────────────────────────────────────────────────────────────────────
+document.querySelectorAll('.nav-tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.nav-tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('view-' + t.dataset.view).classList.add('active');
+    if (t.dataset.view === 'history') loadHistory();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// File handling
+// ─────────────────────────────────────────────────────────────────────────
+const dropzone  = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const submitBtn = document.getElementById('submitBtn');
+
+dropzone.addEventListener('dragover', e => {
+  e.preventDefault(); dropzone.classList.add('drag-over');
+});
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault(); dropzone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) setFile(fileInput.files[0]);
+});
+
+const durationSlider = document.getElementById('durationSlider');
+const durationVal    = document.getElementById('durationVal');
+durationSlider.addEventListener('input', () => {
+  durationVal.textContent = durationSlider.value + 's';
+});
+
+function setFile(f) {
+  currentFile = f;
+  document.getElementById('previewName').textContent = f.name;
+  document.getElementById('previewSize').textContent = humanSize(f.size);
+  document.getElementById('previewIcon').textContent = fileIcon(f.name);
+  document.getElementById('filePreview').classList.add('shown');
+  submitBtn.disabled = false;
+}
+
+function clearFile() {
+  currentFile = null;
+  fileInput.value = '';
+  document.getElementById('filePreview').classList.remove('shown');
+  submitBtn.disabled = true;
+}
+
+function humanSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(2) + ' MB';
+}
+
+function fileIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const map = {exe:'⚙️',dll:'🔩',bat:'📜',ps1:'💙',vbs:'📜',js:'📒',
+               pdf:'📕',doc:'📘',docx:'📘',zip:'📦',rar:'📦','7z':'📦',
+               py:'🐍',jar:'☕',sh:'📜',msi:'📦',scr:'⚠️'};
+  return map[ext] || '📄';
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Submit
+// ─────────────────────────────────────────────────────────────────────────
+async function submitFile() {
+  if (!currentFile) return;
+
+  const formData = new FormData();
+  formData.append('file', currentFile);
+  formData.append('duration', durationSlider.value);
+
+  submitBtn.disabled = true;
+  hideResults();
+  showStatus('queued', 'Uploading…', '');
+
+  try {
+    const r = await fetch('/api/analyze', { method:'POST', body: formData });
+    if (!r.ok) throw new Error(await r.text());
+    const { job_id } = await r.json();
+    currentJobId = job_id;
+    startPolling(job_id);
+  } catch(e) {
+    showStatus('error', 'Upload failed', e.message);
+    submitBtn.disabled = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Polling
+// ─────────────────────────────────────────────────────────────────────────
+const PHASE_PROGRESS = { queued:5, scanning:30, executing:65, complete:100, error:100 };
+
+function startPolling(job_id) {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => poll(job_id), 1500);
+  poll(job_id);
+}
+
+async function poll(job_id) {
+  try {
+    const r = await fetch('/api/status/' + job_id);
+    if (!r.ok) return;
+    const job = await r.json();
+
+    const pct = PHASE_PROGRESS[job.status] || 10;
+    const labels = {
+      queued:    'Queued',
+      scanning:  '🛡 Scanning with Windows Defender…',
+      executing: '▶ Executing sample & monitoring…',
+      complete:  '✓ Analysis complete',
+      error:     '✗ Error'
+    };
+    showStatus(job.status, labels[job.status] || job.status, job.phase || '', pct);
+
+    if (job.status === 'complete' || job.status === 'error') {
+      clearInterval(pollTimer);
+      submitBtn.disabled = false;
+      if (job.status === 'complete') renderResults(job);
+    }
+  } catch(e) { /* network glitch – keep polling */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Status bar
+// ─────────────────────────────────────────────────────────────────────────
+function showStatus(status, label, detail, pct=15) {
+  const bar = document.getElementById('statusBar');
+  bar.classList.add('shown');
+  document.getElementById('statusLabel').textContent = label;
+  document.getElementById('statusDetail').textContent = detail;
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('spinner').style.display =
+    (status === 'complete' || status === 'error') ? 'none' : 'block';
+}
+
+function hideResults() {
+  document.getElementById('resultsPanel').classList.remove('shown');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Render results
+// ─────────────────────────────────────────────────────────────────────────
+function renderResults(job) {
+  const scan = job.scan_result || {};
+  const mon  = job.monitor_result || {};
+  const risk = mon.risk_score || {};
+
+  // ── verdict grid ──
+  const avBadge   = verdictBadge(scan.verdict);
+  const riskBadge = riskBadgeHtml(risk.level, risk.score);
+  document.getElementById('verdictGrid').innerHTML = `
+    <div class="verdict-box">
+      <div class="vb-label">AV Verdict</div>
+      <div class="vb-value">${avBadge}</div>
+      <div class="vb-sub">${scan.threats && scan.threats.length ? scan.threats.join(', ') : (scan.verdict==='clean'?'No threats found':'—')}</div>
+    </div>
+    <div class="verdict-box">
+      <div class="vb-label">Dynamic Risk</div>
+      <div class="vb-value">${riskBadge}</div>
+      <div class="vb-sub">Score: ${risk.score ?? '—'} / 100</div>
+    </div>
+  `;
+
+  // ── file info ──
+  const h = scan.hashes || {};
+  document.getElementById('fileInfoBody').innerHTML = `
+    <div class="hash-grid">
+      <div class="hash-row"><div class="hash-key">Name</div><div class="hash-val">${esc(scan.filename||job.filename)}</div></div>
+      <div class="hash-row"><div class="hash-key">Size</div><div class="hash-val">${humanSize(scan.filesize||0)}</div></div>
+      <div class="hash-row"><div class="hash-key">Magic</div><div class="hash-val">${esc(scan.magic||'—')}</div></div>
+      ${hashRow('MD5',    h.md5)}
+      ${hashRow('SHA-1',  h.sha1)}
+      ${hashRow('SHA-256',h.sha256)}
+    </div>`;
+
+  // ── defender scan ──
+  let defHtml = `<p style="margin-bottom:.8rem">${verdictBadge(scan.verdict)}</p>`;
+  if (scan.threats && scan.threats.length) {
+    defHtml += `<p style="color:var(--red);font-weight:700;margin-bottom:.5rem">Threats detected:</p>
+      <ul style="padding-left:1.2rem;">${scan.threats.map(t=>`<li>${esc(t)}</li>`).join('')}</ul>`;
+  }
+  if (scan.error) defHtml += `<p style="color:var(--yellow);margin-top:.6rem">⚠ ${esc(scan.error)}</p>`;
+  document.getElementById('defenderBody').innerHTML = defHtml;
+
+  // ── raw output ──
+  document.getElementById('rawOutput').textContent = scan.raw_output || '(no output)';
+
+  // ── risk assessment ──
+  if (job.skip_execution) {
+    document.getElementById('riskBody').innerHTML =
+      `<p style="color:var(--yellow)">⚠ ${esc(job.phase)}</p>`;
+  } else {
+    const riskColor = { clean:'var(--green)', low:'var(--green)', medium:'var(--yellow)',
+                        high:'var(--orange)', critical:'var(--red)' }[risk.level] || 'var(--muted)';
+    let reasonsHtml = '';
+    if (risk.reasons && risk.reasons.length) {
+      reasonsHtml = `<ul class="risk-reasons">${risk.reasons.map(r=>`<li>${esc(r)}</li>`).join('')}</ul>`;
+    } else {
+      reasonsHtml = `<p style="color:var(--muted)">No suspicious indicators detected.</p>`;
+    }
+    document.getElementById('riskBody').innerHTML = `
+      <div style="display:flex;align-items:center;gap:2rem;margin-bottom:1rem;flex-wrap:wrap">
+        <div>
+          <div style="font-size:2.5rem;font-weight:800;color:${riskColor}">${risk.score ?? 0}</div>
+          <div style="font-size:.75rem;color:var(--muted);text-transform:uppercase">Risk Score</div>
+        </div>
+        <div style="flex:1">
+          <div class="risk-bar"><div class="risk-fill" style="width:${risk.score||0}%;background:${riskColor}"></div></div>
+          <div style="font-size:.8rem;color:var(--muted)">
+            Duration: ${mon.actual_duration ?? '—'}s &nbsp;|&nbsp;
+            PID: ${mon.sample_pid ?? '—'} &nbsp;|&nbsp;
+            Sysmon: ${mon.sysmon_available ? '✓ available' : '✗ not installed'}
+          </div>
+        </div>
+      </div>
+      ${reasonsHtml}`;
+  }
+
+  // ── processes ──
+  const procs = mon.new_processes || [];
+  document.getElementById('procCount').textContent = `(${procs.length})`;
+  if (procs.length) {
+    const rows = procs.map(p => {
+      const susp = SUSPICIOUS.has((p.name||'').toLowerCase());
+      return `<tr>
+        <td>${p.time}s</td>
+        <td><span class="pid">${p.pid}</span></td>
+        <td class="proc-name ${susp?'proc-susp':''}">${esc(p.name)} ${susp?'⚠':''}
+          <div style="font-size:.75rem;color:var(--muted)">ppid: ${p.ppid||'—'}</div>
+        </td>
+        <td class="mono">${esc((p.cmdline||'').substring(0,150))}</td>
+        <td class="mono" style="font-size:.75rem;color:var(--muted)">${esc((p.exe||'').substring(0,60))}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('procsBody').innerHTML = `
+      <table class="tbl"><thead><tr><th>Time</th><th>PID</th><th>Name</th><th>Command Line</th><th>Path</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } else {
+    document.getElementById('procsBody').innerHTML = `<p style="color:var(--muted)">No new processes observed.</p>`;
+  }
+
+  // ── network ──
+  const conns = mon.new_connections || [];
+  document.getElementById('netCount').textContent = `(${conns.length})`;
+  if (conns.length) {
+    const rows = conns.map(c => `<tr>
+      <td>${c.time}s</td>
+      <td class="mono">${esc(c.laddr)}</td>
+      <td class="mono" style="color:var(--accent)">${esc(c.raddr)}</td>
+      <td>${esc(c.status)}</td>
+      <td><span class="pid">${c.pid||'—'}</span></td>
+    </tr>`).join('');
+    document.getElementById('networkBody').innerHTML = `
+      <table class="tbl"><thead><tr><th>Time</th><th>Local</th><th>Remote</th><th>Status</th><th>PID</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  } else {
+    document.getElementById('networkBody').innerHTML = `<p style="color:var(--muted)">No new network connections observed.</p>`;
+  }
+
+  // ── defender alerts (runtime) ──
+  const alerts = mon.defender_alerts || [];
+  document.getElementById('alertCount').textContent = `(${alerts.length})`;
+  if (alerts.length) {
+    document.getElementById('alertsBody').innerHTML =
+      alerts.map(a => `<div class="alert-item"><pre>${esc(JSON.stringify(a,null,2).substring(0,600))}</pre></div>`).join('');
+  } else {
+    document.getElementById('alertsBody').innerHTML = `<p style="color:var(--green)">✓ No runtime Defender alerts.</p>`;
+  }
+
+  // ── timeline ──
+  const timeline = mon.timeline || [];
+  if (timeline.length) {
+    const items = timeline.map(e => {
+      const cls = tlClass(e.type);
+      return `<div class="tl-item">
+        <div class="tl-time">${e.time}s</div>
+        <div class="tl-type ${cls}">${esc(e.type.replace('_',' '))}</div>
+        <div class="tl-data">${esc(e.data)}</div>
+      </div>`;
+    }).join('');
+    document.getElementById('timelineBody').innerHTML = `<div class="timeline">${items}</div>`;
+  } else {
+    document.getElementById('timelineBody').innerHTML = `<p style="color:var(--muted)">No timeline data (execution may have been skipped).</p>`;
+  }
+
+  document.getElementById('resultsPanel').classList.add('shown');
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// History
+// ─────────────────────────────────────────────────────────────────────────
+async function loadHistory() {
+  const tbody = document.getElementById('historyBody');
+  tbody.innerHTML = '<tr><td colspan="6" class="empty">Loading…</td></tr>';
+  try {
+    const r    = await fetch('/api/jobs');
+    const jobs = await r.json();
+    if (!jobs.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No analyses yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = jobs.map(j => `
+      <tr class="hist-row" onclick="loadJob('${j.job_id}')">
+        <td>${fileIcon(j.filename||'')} ${esc(j.filename||'—')}</td>
+        <td style="color:var(--muted);font-size:.8rem">${fmtDate(j.submitted_at)}</td>
+        <td>${statusPill(j.status)}</td>
+        <td>${verdictBadge(j.verdict)}</td>
+        <td>${riskBadgeHtml(j.risk_level, j.risk_score)}</td>
+        <td><button class="btn btn-danger" onclick="deleteJob(event,'${j.job_id}')">✕</button></td>
+      </tr>`).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">Error: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function loadJob(job_id) {
+  // Switch to scan view and show results
+  document.querySelectorAll('.nav-tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
+  document.querySelector('[data-view=scan]').classList.add('active');
+  document.getElementById('view-scan').classList.add('active');
+
+  try {
+    const r   = await fetch('/api/status/' + job_id);
+    const job = await r.json();
+    showStatus('complete','✓ Loaded from history','', 100);
+    renderResults(job);
+  } catch(e) { alert('Could not load job: ' + e.message); }
+}
+
+async function deleteJob(e, job_id) {
+  e.stopPropagation();
+  if (!confirm('Delete this analysis?')) return;
+  await fetch('/api/jobs/' + job_id, { method:'DELETE' });
+  loadHistory();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function verdictBadge(v) {
+  const map = {
+    clean:          '<span class="badge badge-clean">✓ Clean</span>',
+    threat_detected:'<span class="badge badge-threat">⚠ Threat Detected</span>',
+    scan_error:     '<span class="badge badge-error">⚡ Scan Error</span>',
+    scan_timeout:   '<span class="badge badge-error">⏱ Timeout</span>',
+    error:          '<span class="badge badge-error">Error</span>',
+  };
+  return map[v] || `<span class="badge badge-error">${esc(v||'—')}</span>`;
+}
+
+function riskBadgeHtml(level, score) {
+  if (!level) return '<span style="color:var(--muted)">—</span>';
+  return `<span class="badge badge-${level}">${(level||'').toUpperCase()}${score!=null?' ('+score+')':''}</span>`;
+}
+
+function statusPill(s) {
+  const map = {
+    complete: '<span style="color:var(--green)">✓ Done</span>',
+    scanning: '<span style="color:var(--accent)">Scanning…</span>',
+    executing:'<span style="color:var(--accent)">Executing…</span>',
+    error:    '<span style="color:var(--red)">✗ Error</span>',
+    queued:   '<span style="color:var(--muted)">Queued</span>',
+  };
+  return map[s] || esc(s);
+}
+
+function tlClass(t) {
+  if (t.includes('exec'))    return 'tl-exec';
+  if (t.includes('process')) return 'tl-proc';
+  if (t.includes('network')) return 'tl-net';
+  if (t.includes('defender')) return 'tl-def';
+  if (t.includes('terminat')) return 'tl-kill';
+  if (t.includes('exit'))    return 'tl-exit';
+  return 'tl-other';
+}
+
+function hashRow(label, val) {
+  if (!val) return '';
+  return `<div class="hash-row">
+    <div class="hash-key">${label}</div>
+    <div class="hash-val">${esc(val)}
+      <button class="copy-btn" title="Copy" onclick="copyText('${val}')">⧉</button>
+    </div>
+  </div>`;
+}
+
+function copyText(t) {
+  navigator.clipboard.writeText(t).catch(()=>{});
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+}
+
+function toggleSection(header) {
+  header.classList.toggle('collapsed');
+  const body = header.nextElementSibling;
+  body.classList.toggle('collapsed');
+}
+</script>
+</body>
+</html>
