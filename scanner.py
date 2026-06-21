@@ -1,43 +1,45 @@
 """
-scanner.py - Windows Defender static scan integration
-Calls MpCmdRun.exe, parses output, returns structured verdict.
+scanner.py — Windows Defender static scan integration.
+
+Provides scan_with_defender(), which runs a targeted MpCmdRun.exe scan
+and returns a structured verdict dict (hashes, threats, raw output, etc.).
+
+MpCmdRun.exe discovery is delegated to defender_check.scanner.locate_mpcmdrun()
+so both the sandbox and signature-analysis modes use identical discovery logic
+(registry → static path → platform-versioned directory).
 """
 
-import subprocess
-import os
 import hashlib
+import os
 import re
+import subprocess
 from datetime import datetime
 
-DEFENDER_PATHS = [
-    r"C:\Program Files\Windows Defender\MpCmdRun.exe",
-    r"C:\ProgramData\Microsoft\Windows Defender\Platform",  # fallback – we'll search
-]
+from defender_check.scanner import locate_mpcmdrun as _locate_mpcmdrun
 
+
+# ── MpCmdRun discovery ────────────────────────────────────────────────────────
 
 def find_mpcmdrun() -> str | None:
-    """Locate MpCmdRun.exe – the path moves with platform updates."""
-    static = r"C:\Program Files\Windows Defender\MpCmdRun.exe"
-    if os.path.exists(static):
-        return static
+    """
+    Return the path to MpCmdRun.exe, or None if not found.
 
-    # Search the platform directory for the newest version
-    platform_dir = r"C:\ProgramData\Microsoft\Windows Defender\Platform"
-    if os.path.isdir(platform_dir):
-        versions = sorted(os.listdir(platform_dir), reverse=True)
-        for v in versions:
-            candidate = os.path.join(platform_dir, v, "MpCmdRun.exe")
-            if os.path.exists(candidate):
-                return candidate
+    Wraps defender_check.scanner.locate_mpcmdrun() so both analysis modes
+    share the same search order: registry → static path → platform directory.
+    """
+    try:
+        return _locate_mpcmdrun()
+    except FileNotFoundError:
+        return None
 
-    return None
 
+# ── File metadata ─────────────────────────────────────────────────────────────
 
 def get_file_hashes(filepath: str) -> dict:
     hashes = {}
     try:
-        with open(filepath, "rb") as f:
-            data = f.read()
+        with open(filepath, "rb") as fh:
+            data = fh.read()
         hashes["md5"]    = hashlib.md5(data).hexdigest()
         hashes["sha1"]   = hashlib.sha1(data).hexdigest()
         hashes["sha256"] = hashlib.sha256(data).hexdigest()
@@ -49,16 +51,27 @@ def get_file_hashes(filepath: str) -> dict:
 def get_file_magic(filepath: str) -> str:
     """Read first 8 bytes and return a hex magic string."""
     try:
-        with open(filepath, "rb") as f:
-            return f.read(8).hex().upper()
+        with open(filepath, "rb") as fh:
+            return fh.read(8).hex().upper()
     except Exception:
         return "unknown"
 
 
+# ── Static scan ───────────────────────────────────────────────────────────────
+
 def scan_with_defender(filepath: str) -> dict:
     """
-    Run a targeted scan with Windows Defender.
-    Returns a structured dict with verdict, threat names, hashes, etc.
+    Run a targeted Windows Defender scan on *filepath*.
+
+    Returns a structured dict with:
+      verdict     — "clean" | "threat_detected" | "scan_error" | "scan_timeout" | "error"
+      threats     — list of threat name strings (if any)
+      hashes      — md5 / sha1 / sha256
+      filesize    — bytes
+      magic       — first 8 bytes as uppercase hex
+      raw_output  — full MpCmdRun.exe stdout+stderr
+      return_code — MpCmdRun exit code (0 = clean, 2 = threat)
+      error       — human-readable error string, or None
     """
     result = {
         "timestamp":   datetime.now().isoformat(),
@@ -85,11 +98,12 @@ def scan_with_defender(filepath: str) -> dict:
     mpcmd = find_mpcmdrun()
     if not mpcmd:
         result["verdict"] = "error"
-        result["error"]   = "MpCmdRun.exe not found – is Windows Defender installed?"
+        result["error"]   = "MpCmdRun.exe not found — is Windows Defender installed?"
         return result
 
     try:
-        # -DisableRemediation prevents Defender from quarantining during scan
+        # -DisableRemediation prevents Defender from quarantining during the scan
+        # so we can still execute the sample in sandbox mode.
         proc = subprocess.run(
             [mpcmd, "-Scan", "-ScanType", "3", "-File", filepath, "-DisableRemediation"],
             capture_output=True,
@@ -100,25 +114,23 @@ def scan_with_defender(filepath: str) -> dict:
         result["raw_output"]  = output.strip()
         result["return_code"] = proc.returncode
 
-        # Return code semantics:
-        #   0 = clean / no threat found
-        #   2 = threat found
-        #  -2147023895 (0x80070019) = access denied / file locked
         if proc.returncode == 2:
             result["verdict"] = "threat_detected"
-            # Try to extract threat name from output
+            # Primary: look for an explicit "Threat name: …" line
             matches = re.findall(r"(?i)threat(?:\s+name)?\s*[:\-]\s*(.+)", output)
             if matches:
                 result["threats"] = [m.strip() for m in matches]
             else:
-                # Fallback: any line mentioning a threat keyword
+                # Fallback: scan lines for known malware keywords
                 for line in output.splitlines():
-                    if any(k in line.lower() for k in ["trojan", "virus", "malware",
-                                                        "ransom", "exploit", "worm",
-                                                        "backdoor", "adware", "spyware"]):
+                    if any(k in line.lower() for k in [
+                        "trojan", "virus", "malware", "ransom", "exploit",
+                        "worm", "backdoor", "adware", "spyware",
+                    ]):
                         result["threats"].append(line.strip())
                 if not result["threats"]:
                     result["threats"] = ["Unknown threat (Defender return code 2)"]
+
         elif proc.returncode == 0:
             result["verdict"] = "clean"
         else:

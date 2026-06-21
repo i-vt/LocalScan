@@ -4,23 +4,29 @@
     Sets up the LocalScan malware analysis sandbox on a fresh Windows VM.
 
 .DESCRIPTION
-    1. Installs Python 3 (via winget, then pip)
-    2. Creates C:\MalwareAnalysis directory layout
-    3. Copies source files (expects them next to this script)
-    4. Installs pip dependencies
-    5. Configures Windows Defender (keeps real-time on, disables cloud reporting)
-    6. Enables process-creation audit policy (Event ID 4688)
-    7. Installs Sysmon for deep process/network visibility (optional)
-    8. Opens firewall for port 5000
-    9. Creates a Scheduled Task that launches the server on user login
-   10. Adds a desktop shortcut
+    1.  Verifies Windows Defender is running
+    2.  Installs Python 3 (via winget, then pip)
+    3.  Creates C:\MalwareAnalysis directory layout
+    4.  Copies all source files (including the defender_check package)
+    5.  Installs pip dependencies
+    6.  Configures Windows Defender for dual-mode operation:
+          Sandbox mode    -- real-time protection ON (captures runtime alerts)
+          Signature mode  -- dedicated tmp\ excluded so slice files are never
+                            quarantined during binary search
+    7.  Enables process-creation audit policy (Event ID 4688)
+    8.  Installs Sysmon (optional, improves telemetry)
+    9.  Opens firewall for port 5000
+    10. Creates a launcher script (sets TMPDIR so Python uses the excluded dir)
+    11. Creates a Scheduled Task that runs the server at login
+    12. Adds a desktop shortcut
+    13. Launches the server immediately
 
 .NOTES
     Run from the folder containing app.py, scanner.py, monitor.py,
-    requirements.txt, and the templates\ folder.
+    requirements.txt, templates\ and defender_check\.
 
     Tested on Windows 10 / 11 (x64).
-    For an isolated VirtualBox VM only -- do NOT run on a production machine.
+    For an isolated VirtualBox VM ONLY -- do NOT run on a production machine.
 #>
 
 Set-StrictMode -Version Latest
@@ -48,7 +54,20 @@ $InstallDir = "C:\MalwareAnalysis"
 $PythonExe  = $null
 
 # ---------------------------------------------------------------------------
-# 1. Python
+# 1. Verify Windows Defender is running
+# ---------------------------------------------------------------------------
+Write-Step "Verifying Windows Defender service"
+
+$defSvc = Get-Service -Name WinDefend -ErrorAction SilentlyContinue
+if (-not $defSvc -or $defSvc.Status -ne "Running") {
+    Write-Err "Windows Defender (WinDefend) is not running."
+    Write-Err "LocalScan requires Defender enabled. Enable it and re-run setup."
+    exit 1
+}
+Write-Ok "WinDefend service is running"
+
+# ---------------------------------------------------------------------------
+# 2. Python
 # ---------------------------------------------------------------------------
 Write-Step "Checking for Python 3.10+"
 
@@ -78,35 +97,42 @@ if (-not $PythonExe) {
 }
 
 # ---------------------------------------------------------------------------
-# 2. Create directory layout
+# 3. Create directory layout
 # ---------------------------------------------------------------------------
 Write-Step "Creating directory layout at $InstallDir"
 
-foreach ($dir in @($InstallDir,
-                   "$InstallDir\uploads",
-                   "$InstallDir\results",
-                   "$InstallDir\templates",
-                   "$InstallDir\logs")) {
+foreach ($dir in @(
+    $InstallDir,
+    "$InstallDir\uploads",
+    "$InstallDir\results",
+    "$InstallDir\templates",
+    "$InstallDir\logs",
+    "$InstallDir\tmp",
+    "$InstallDir\defender_check"
+)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
 }
-Write-Ok "Directories created"
+Write-Ok "Directories created (including tmp\ for signature analysis)"
 
 # ---------------------------------------------------------------------------
-# 3. Copy source files
+# 4. Copy source files
 # ---------------------------------------------------------------------------
 Write-Step "Copying source files from $ScriptDir"
 
-$requiredFiles = @("app.py", "scanner.py", "monitor.py", "requirements.txt")
-foreach ($f in $requiredFiles) {
+# Top-level Python files
+foreach ($f in @("app.py", "scanner.py", "monitor.py", "requirements.txt", "requirements-dev.txt")) {
     $src = Join-Path $ScriptDir $f
-    if (-not (Test-Path $src)) {
+    if (Test-Path $src) {
+        Copy-Item $src $InstallDir -Force
+        Write-Ok "Copied $f"
+    }
+    elseif ($f -notin @("requirements-dev.txt")) {
         Write-Err "Missing required file: $f  (looked in $ScriptDir)"
         exit 1
     }
-    Copy-Item $src $InstallDir -Force
-    Write-Ok "Copied $f"
 }
 
+# templates\
 $tplSrc = Join-Path $ScriptDir "templates"
 if (Test-Path $tplSrc) {
     Copy-Item "$tplSrc\*" "$InstallDir\templates\" -Recurse -Force
@@ -117,8 +143,19 @@ else {
     exit 1
 }
 
+# defender_check\ package
+$dcSrc = Join-Path $ScriptDir "defender_check"
+if (Test-Path $dcSrc) {
+    Copy-Item "$dcSrc\*" "$InstallDir\defender_check\" -Recurse -Force
+    Write-Ok "Copied defender_check\ package"
+}
+else {
+    Write-Err "defender_check\ folder not found in $ScriptDir"
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
-# 4. pip install
+# 5. pip install
 # ---------------------------------------------------------------------------
 Write-Step "Installing Python dependencies"
 
@@ -129,7 +166,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Err "pip install failed"
     exit 1
 }
-Write-Ok "Dependencies installed (flask, psutil, pywin32)"
+Write-Ok "Installed: flask, psutil, pywin32, pefile, tqdm"
 
 try {
     $scripts = Join-Path (Split-Path $PythonExe) "Scripts"
@@ -140,24 +177,82 @@ try {
     }
 }
 catch {
-    Write-Warn "pywin32 post-install skipped (not always needed on Python 3.11+)"
+    Write-Warn "pywin32 post-install skipped (not always required on Python 3.11+)"
 }
 
 # ---------------------------------------------------------------------------
-# 5. Windows Defender tuning
+# 5. Windows Defender -- dual-mode configuration
+#
+# Sandbox mode needs real-time protection ON:
+#   Defender firing against a live sample is the primary signal we are
+#   measuring. Turning real-time off would silence the runtime alerts that
+#   drive the risk score.
+#
+# Signature mode needs the tmp\ dir excluded:
+#   DefenderCheck's binary search writes and reads hundreds of partial file
+#   slices into a temp directory. With real-time protection scanning those
+#   files, Defender can quarantine a slice the instant it is written -- before
+#   MpCmdRun even gets to scan it -- causing false "no threat" results and
+#   corrupting the binary search. Excluding just the tmp\ directory lets
+#   real-time protection stay fully on everywhere else.
 # ---------------------------------------------------------------------------
-Write-Step "Configuring Windows Defender"
+Write-Step "Configuring Windows Defender for dual-mode operation"
 
-Set-MpPreference -SubmitSamplesConsent  NeverSend -ErrorAction SilentlyContinue
-Set-MpPreference -MAPSReporting         Disabled  -ErrorAction SilentlyContinue
-Set-MpPreference -DisableAutoExclusions $false    -ErrorAction SilentlyContinue
-Add-MpPreference -ExclusionPath "$InstallDir\uploads" -ErrorAction SilentlyContinue
+# -- Real-time protection: ON --
+# Do not disable this. Sandbox mode depends on it.
+Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+Write-Ok "Real-time protection            : ON  (required for sandbox mode)"
 
-Write-Ok "Defender configured (real-time ON, cloud reporting OFF, uploads\ excluded from auto-quarantine)"
-Write-Warn "Samples in uploads\ will NOT be auto-quarantined. Keep this VM isolated!"
+# -- Behavioral monitoring: ON --
+# Catches in-memory and fileless techniques during sandbox execution.
+Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
+Write-Ok "Behavioral monitoring           : ON"
+
+# -- Script scanning: ON --
+# Catches PowerShell / VBScript / JS payloads executed by samples.
+Set-MpPreference -DisableScriptScanning $false -ErrorAction SilentlyContinue
+Write-Ok "Script scanning                 : ON"
+
+# -- Cloud protection / MAPS: OFF --
+# Samples must never be uploaded to Microsoft.
+Set-MpPreference -MAPSReporting           Disabled  -ErrorAction SilentlyContinue
+Set-MpPreference -SubmitSamplesConsent    NeverSend -ErrorAction SilentlyContinue
+Set-MpPreference -DisableBlockAtFirstSeen $true     -ErrorAction SilentlyContinue
+Write-Ok "Cloud / MAPS / sample upload    : OFF (samples stay on this VM)"
+
+# -- Network protection: OFF --
+# We want to observe the complete network behaviour of samples, including
+# connections to known-bad IPs that network protection would otherwise silently
+# block. Isolation must be enforced at the hypervisor (host-only adapter),
+# not by Defender.
+Set-MpPreference -EnableNetworkProtection Disabled -ErrorAction SilentlyContinue
+Write-Ok "Network protection              : OFF (observe full network behaviour)"
+
+# -- Controlled folder access: OFF --
+# CFA would block samples from writing files to protected paths, preventing
+# observation of file-drop behaviour.
+Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue
+Write-Ok "Controlled folder access        : OFF (allows observation of file drops)"
+
+# -- Path exclusions --
+# uploads\  Samples must be scannable then executable without quarantine.
+# results\  Patched binaries from signature analysis land here.
+# tmp\      DefenderCheck's temp slice files. Excluding this dir is what
+#           allows real-time protection to stay on everywhere else.
+foreach ($p in @(
+    "$InstallDir\uploads",
+    "$InstallDir\results",
+    "$InstallDir\tmp"
+)) {
+    Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue
+    Write-Ok "Excluded from real-time scan    : $p"
+}
+
+Write-Warn "uploads\ and tmp\ are excluded from real-time scanning."
+Write-Warn "Isolate this VM at the hypervisor level -- host-only or isolated NAT adapter."
 
 # ---------------------------------------------------------------------------
-# 6. Enable process-creation audit (Event ID 4688)
+# 7. Enable process-creation audit (Event ID 4688)
 # ---------------------------------------------------------------------------
 Write-Step "Enabling process creation audit policy (Event ID 4688)"
 
@@ -172,7 +267,7 @@ Set-ItemProperty -Path $regPath -Name "ProcessCreationIncludeCmdLine_Enabled" -V
 Write-Ok "Process creation (with command line) logging enabled"
 
 # ---------------------------------------------------------------------------
-# 7. Sysmon (optional)
+# 8. Sysmon (optional)
 # ---------------------------------------------------------------------------
 Write-Step "Checking for Sysmon"
 
@@ -236,13 +331,13 @@ else {
     }
     catch {
         Write-Warn "Sysmon auto-install failed: $_"
-        Write-Warn "Download manually from https://docs.microsoft.com/sysinternals/downloads/sysmon"
-        Write-Warn "The sandbox works without it -- you just get less telemetry."
+        Write-Warn "Download manually: https://docs.microsoft.com/sysinternals/downloads/sysmon"
+        Write-Warn "The sandbox works without Sysmon -- you just get less telemetry."
     }
 }
 
 # ---------------------------------------------------------------------------
-# 8. Firewall rule for port 5000
+# 9. Firewall rule for port 5000
 # ---------------------------------------------------------------------------
 Write-Step "Adding Windows Firewall rule (TCP 5000 inbound)"
 
@@ -260,24 +355,37 @@ New-NetFirewallRule -DisplayName $ruleName `
 Write-Ok "Firewall rule '$ruleName' created (TCP 5000 inbound)"
 
 # ---------------------------------------------------------------------------
-# 9. Launcher script
+# 10. Launcher script
+#
+# Sets TMPDIR / TMP / TEMP to $InstallDir\tmp before starting Python so that
+# DefenderCheck's tempfile.mkdtemp() calls land in the Defender-excluded
+# directory. Without this, slice files go to the system %TEMP% and real-time
+# protection may quarantine them during signature analysis.
 # ---------------------------------------------------------------------------
 Write-Step "Creating launcher script"
 
 $launcherPath = "$InstallDir\start_server.ps1"
 $launcherContent = @"
-# LocalScan server launcher
+# LocalScan server launcher -- generated by setup.ps1
+
+# Route Python's temp files to the Defender-excluded directory so that
+# signature analysis slice files are never touched by real-time protection.
+`$env:TMPDIR = '$InstallDir\tmp'
+`$env:TMP    = '$InstallDir\tmp'
+`$env:TEMP   = '$InstallDir\tmp'
+
 Set-Location '$InstallDir'
 Start-Transcript -Path '$InstallDir\logs\server.log' -Append -NoClobber
 Write-Host 'Starting LocalScan on http://localhost:5000 ...'
 & '$PythonExe' app.py
 "@
-$launcherContent | Out-File -Encoding UTF8 -FilePath $launcherPath
+$launcherContent | Out-File -Encoding ASCII -FilePath $launcherPath
 
 Write-Ok "Launcher written to $launcherPath"
+Write-Ok "  TMPDIR set to $InstallDir\tmp (Defender-excluded, used by signature analysis)"
 
 # ---------------------------------------------------------------------------
-# 10. Scheduled Task (at login, hidden window)
+# 11. Scheduled Task (at login, hidden window)
 # ---------------------------------------------------------------------------
 Write-Step "Creating Scheduled Task 'LocalScan-Server'"
 
@@ -307,19 +415,19 @@ Register-ScheduledTask -TaskName $taskName `
 Write-Ok "Scheduled Task created (runs at login, elevated)"
 
 # ---------------------------------------------------------------------------
-# 11. Desktop shortcut
+# 12. Desktop shortcut
 # ---------------------------------------------------------------------------
 Write-Step "Creating desktop shortcut"
 
 $wsh      = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut("$env:PUBLIC\Desktop\LocalScan.lnk")
 $shortcut.TargetPath  = "http://localhost:5000"
-$shortcut.Description = "LocalScan Malware Analysis Sandbox"
+$shortcut.Description = "LocalScan - Malware Analysis Sandbox + Signature Analyser"
 $shortcut.Save()
 Write-Ok "Shortcut created on Public Desktop"
 
 # ---------------------------------------------------------------------------
-# 12. Start server now
+# 13. Start server now
 # ---------------------------------------------------------------------------
 Write-Step "Launching server in a new window"
 
@@ -331,18 +439,30 @@ Start-Sleep -Seconds 3
 Write-Ok "Server should be starting at http://localhost:5000"
 
 # ---------------------------------------------------------------------------
-# Done
+# Done -- print summary
 # ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host "==========================================================" -ForegroundColor Magenta
 Write-Host "  LocalScan setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Web UI  : http://localhost:5000" -ForegroundColor White
-Write-Host "  Install : $InstallDir" -ForegroundColor White
-Write-Host "  Logs    : $InstallDir\logs\server.log" -ForegroundColor White
-Write-Host "  Uploads : $InstallDir\uploads\" -ForegroundColor White
-Write-Host "  Results : $InstallDir\results\" -ForegroundColor White
+Write-Host "  Web UI       : http://localhost:5000" -ForegroundColor White
+Write-Host "  Install dir  : $InstallDir" -ForegroundColor White
+Write-Host "  Logs         : $InstallDir\logs\server.log" -ForegroundColor White
+Write-Host "  Uploads      : $InstallDir\uploads\" -ForegroundColor White
+Write-Host "  Results      : $InstallDir\results\" -ForegroundColor White
+Write-Host "  Temp (sig)   : $InstallDir\tmp\" -ForegroundColor White
+Write-Host ""
+Write-Host "  Defender settings applied:" -ForegroundColor Cyan
+Write-Host "    Real-time protection    ON   (sandbox mode -- do not disable)" -ForegroundColor White
+Write-Host "    Behavioral monitoring   ON" -ForegroundColor White
+Write-Host "    Script scanning         ON" -ForegroundColor White
+Write-Host "    Cloud / MAPS / upload   OFF  (samples stay on this VM)" -ForegroundColor White
+Write-Host "    Network protection      OFF  (observe full network behaviour)" -ForegroundColor White
+Write-Host "    Controlled folder access OFF (observe file drops)" -ForegroundColor White
+Write-Host "    Excluded paths:" -ForegroundColor White
+Write-Host "      uploads\  results\  tmp\" -ForegroundColor White
 Write-Host ""
 Write-Host "  REMINDER: Keep this VM isolated from production networks." -ForegroundColor Yellow
-Write-Host "  Snapshot the VM now and restore after each analysis session." -ForegroundColor Yellow
+Write-Host "  Use a host-only or isolated NAT adapter -- not bridged." -ForegroundColor Yellow
+Write-Host "  Take a snapshot now and restore after each analysis session." -ForegroundColor Yellow
 Write-Host "==========================================================" -ForegroundColor Magenta

@@ -1,35 +1,51 @@
 """
-app.py - Local VirusTotal equivalent – Flask API + web UI
-Endpoints:
-  POST /api/analyze   – upload file, returns {job_id}
-  GET  /api/status/<job_id> – poll for results
-  GET  /api/jobs      – list recent jobs
-  DELETE /api/jobs/<job_id> – remove a job + its upload
+app.py — LocalScan Flask API + web UI.
+
+Two analysis modes share the same job lifecycle and UI:
+
+  Sandbox mode  (mode="sandbox", default)
+    Phase 1 — static scan via Windows Defender (scanner.scan_with_defender)
+    Phase 2 — dynamic execution monitoring     (monitor.execute_and_monitor)
+
+  Signature mode  (mode="signature")
+    Phase 1 — static scan (hashes, initial verdict)
+    Phase 2 — DefenderCheck signature analysis (binary search → sensitivity
+              → YARA generation, defender_check.orchestrator.analyse)
+
+API endpoints
+-------------
+  POST   /api/analyze              submit a file; returns {job_id}
+  GET    /api/status/<job_id>      poll for results
+  GET    /api/jobs                 list recent jobs (summary)
+  DELETE /api/jobs/<job_id>        delete job + uploaded file
+  GET    /api/jobs/<job_id>/patched   download patched binary (signature mode)
+  GET    /api/jobs/<job_id>/yara      download YARA rules     (signature mode)
 """
 
-import os
-import uuid
 import json
+import os
 import threading
-import hashlib
+import uuid
+from dataclasses import asdict
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template, abort
 
-# ── optional persistence: keep results in a JSON file ────────────────────────
+from flask import Flask, abort, jsonify, render_template, request, send_file
+
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR  = os.path.join(BASE_DIR, "uploads")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
-for d in (UPLOAD_DIR, RESULTS_DIR):
-    os.makedirs(d, exist_ok=True)
+for _d in (UPLOAD_DIR, RESULTS_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 app = Flask(__name__, template_folder="templates")
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB max upload
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB
 
-# In-memory job store  {job_id: job_dict}
-# On startup we reload from disk so results survive a server restart.
+# In-memory job store {job_id: job_dict}; reloaded from disk on startup.
 jobs: dict = {}
 
+
+# ── Persistence ───────────────────────────────────────────────────────────────
 
 def _load_results_from_disk():
     for fname in os.listdir(RESULTS_DIR):
@@ -51,31 +67,29 @@ def _persist_job(job_id: str):
         pass
 
 
-# ── analysis pipeline ─────────────────────────────────────────────────────────
+# ── Analysis pipelines ────────────────────────────────────────────────────────
 
-def run_analysis(job_id: str, filepath: str, duration: int):
+def _run_sandbox(job_id: str, filepath: str, duration: int):
+    """Phase 1: static scan. Phase 2: dynamic execution."""
     from scanner import scan_with_defender
     from monitor import execute_and_monitor
 
     try:
-        # Phase 1 – static scan
-        jobs[job_id]["status"]  = "scanning"
-        jobs[job_id]["phase"]   = "Running Windows Defender scan…"
+        jobs[job_id]["status"] = "scanning"
+        jobs[job_id]["phase"]  = "Running Windows Defender scan…"
         _persist_job(job_id)
 
         scan_result = scan_with_defender(filepath)
         jobs[job_id]["scan_result"] = scan_result
 
-        # If Defender already quarantined the file skip execution
         if scan_result.get("verdict") == "threat_detected":
             jobs[job_id]["skip_execution"] = True
             jobs[job_id]["phase"] = (
-                "Threat detected during static scan – skipping live execution "
-                "(file may have been quarantined by Defender). "
-                "Toggle DisableRemediation in scanner.py to execute anyway."
+                "Threat detected during static scan — skipping live execution "
+                "(file may have been quarantined). Toggle DisableRemediation in "
+                "scanner.py to execute anyway."
             )
 
-        # Phase 2 – dynamic execution
         if not jobs[job_id].get("skip_execution"):
             jobs[job_id]["status"] = "executing"
             jobs[job_id]["phase"]  = f"Executing sample and monitoring for {duration}s…"
@@ -86,8 +100,8 @@ def run_analysis(job_id: str, filepath: str, duration: int):
         else:
             jobs[job_id]["monitor_result"] = None
 
-        jobs[job_id]["status"]     = "complete"
-        jobs[job_id]["phase"]      = "Done"
+        jobs[job_id]["status"]       = "complete"
+        jobs[job_id]["phase"]        = "Done"
         jobs[job_id]["completed_at"] = datetime.now().isoformat()
 
     except Exception as e:
@@ -97,7 +111,74 @@ def run_analysis(job_id: str, filepath: str, duration: int):
     _persist_job(job_id)
 
 
-# ── routes ────────────────────────────────────────────────────────────────────
+def _run_signature(job_id: str, filepath: str, no_sensitivity: bool):
+    """
+    Phase 1: static scan (hashes + verdict).
+    Phase 2: DefenderCheck binary-search signature analysis.
+    """
+    from scanner import scan_with_defender
+    from defender_check.scanner import configure, locate_mpcmdrun
+    from defender_check.orchestrator import analyse
+
+    try:
+        # Phase 1 — static scan for hashes / initial verdict
+        jobs[job_id]["status"] = "scanning"
+        jobs[job_id]["phase"]  = "Running Windows Defender scan…"
+        _persist_job(job_id)
+
+        scan_result = scan_with_defender(filepath)
+        jobs[job_id]["scan_result"] = scan_result
+
+        # Phase 2 — signature analysis (only useful when Defender flags the file)
+        jobs[job_id]["status"] = "analyzing"
+        sens_note = " (sensitivity analysis disabled)" if no_sensitivity else ""
+        jobs[job_id]["phase"]  = f"Running signature analysis{sens_note}…"
+        _persist_job(job_id)
+
+        try:
+            configure(locate_mpcmdrun())
+        except FileNotFoundError as exc:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["phase"]  = str(exc)
+            _persist_job(job_id)
+            return
+
+        report = analyse(filepath, no_sensitivity=no_sensitivity, quiet=True)
+        sig_dict = asdict(report)
+
+        # Record paths to generated files so endpoints can serve them
+        jobs[job_id]["signature_result"]  = sig_dict
+        jobs[job_id]["patched_file_path"] = sig_dict.get("patched_file")
+        jobs[job_id]["yara_file_path"]    = _yara_path_for(filepath)
+
+        hit_count = len(sig_dict.get("hits", []))
+        jobs[job_id]["status"]       = "complete"
+        jobs[job_id]["phase"]        = f"Done — {hit_count} signature(s) found"
+        jobs[job_id]["completed_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["phase"]  = f"Internal error: {e}"
+
+    _persist_job(job_id)
+
+
+def _yara_path_for(filepath: str) -> str | None:
+    """Return the YARA file path that DefenderCheck would have written, if it exists."""
+    base, _ = os.path.splitext(filepath)
+    candidate = f"{base}_signatures.yar"
+    return candidate if os.path.exists(candidate) else None
+
+
+def run_analysis(job_id: str, filepath: str, duration: int,
+                 mode: str, no_sensitivity: bool):
+    if mode == "signature":
+        _run_signature(job_id, filepath, no_sensitivity)
+    else:
+        _run_sandbox(job_id, filepath, duration)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -109,33 +190,42 @@ def analyze():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
-    f        = request.files["file"]
-    duration = int(request.form.get("duration", 30))
-    duration = max(5, min(duration, 300))   # clamp 5 – 300 s
-
+    f    = request.files["file"]
     if f.filename == "":
         return jsonify({"error": "Empty filename"}), 400
 
-    job_id   = str(uuid.uuid4())
-    # Prefix with job_id to avoid collisions
+    mode           = request.form.get("mode", "sandbox")
+    duration       = int(request.form.get("duration", 30))
+    duration       = max(5, min(duration, 300))
+    no_sensitivity = request.form.get("no_sensitivity", "false").lower() == "true"
+
+    job_id    = str(uuid.uuid4())
     safe_name = f"{job_id}_{f.filename}"
     filepath  = os.path.join(UPLOAD_DIR, safe_name)
     f.save(filepath)
 
     jobs[job_id] = {
-        "job_id":      job_id,
-        "filename":    f.filename,
-        "filepath":    filepath,
-        "duration":    duration,
-        "status":      "queued",
-        "phase":       "Queued",
-        "submitted_at": datetime.now().isoformat(),
-        "scan_result":  None,
-        "monitor_result": None,
+        "job_id":            job_id,
+        "filename":          f.filename,
+        "filepath":          filepath,
+        "mode":              mode,
+        "duration":          duration,
+        "no_sensitivity":    no_sensitivity,
+        "status":            "queued",
+        "phase":             "Queued",
+        "submitted_at":      datetime.now().isoformat(),
+        "completed_at":      None,
+        "scan_result":       None,
+        "monitor_result":    None,
+        "signature_result":  None,
+        "patched_file_path": None,
+        "yara_file_path":    None,
     }
 
     t = threading.Thread(
-        target=run_analysis, args=(job_id, filepath, duration), daemon=True
+        target=run_analysis,
+        args=(job_id, filepath, duration, mode, no_sensitivity),
+        daemon=True,
     )
     t.start()
 
@@ -146,7 +236,6 @@ def analyze():
 def status(job_id: str):
     job = jobs.get(job_id)
     if not job:
-        # Try loading from disk
         path = os.path.join(RESULTS_DIR, f"{job_id}.json")
         if os.path.exists(path):
             with open(path) as fh:
@@ -160,32 +249,38 @@ def status(job_id: str):
 @app.route("/api/jobs")
 def list_jobs():
     summary = []
-    for jid, j in sorted(jobs.items(),
-                          key=lambda x: x[1].get("submitted_at", ""),
-                          reverse=True):
-        scan  = j.get("scan_result") or {}
-        mon   = j.get("monitor_result") or {}
-        risk  = mon.get("risk_score", {})
+    for jid, j in sorted(
+        jobs.items(), key=lambda x: x[1].get("submitted_at", ""), reverse=True
+    ):
+        scan = j.get("scan_result") or {}
+        mon  = j.get("monitor_result") or {}
+        sig  = j.get("signature_result") or {}
+        risk = mon.get("risk_score", {})
         summary.append({
             "job_id":       jid,
             "filename":     j.get("filename"),
+            "mode":         j.get("mode", "sandbox"),
             "status":       j.get("status"),
             "submitted_at": j.get("submitted_at"),
             "verdict":      scan.get("verdict"),
             "risk_level":   risk.get("level"),
             "risk_score":   risk.get("score"),
+            "sig_hits":     len(sig.get("hits", [])),
         })
-    return jsonify(summary[:50])   # last 50
+    return jsonify(summary[:50])
 
 
 @app.route("/api/jobs/<job_id>", methods=["DELETE"])
 def delete_job(job_id: str):
     job = jobs.pop(job_id, None)
     if job:
-        try:
-            os.remove(job["filepath"])
-        except Exception:
-            pass
+        for path_key in ("filepath", "patched_file_path", "yara_file_path"):
+            p = job.get(path_key)
+            if p:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
         try:
             os.remove(os.path.join(RESULTS_DIR, f"{job_id}.json"))
         except Exception:
@@ -194,12 +289,41 @@ def delete_job(job_id: str):
     return jsonify({"error": "Not found"}), 404
 
 
-# ── startup ───────────────────────────────────────────────────────────────────
+@app.route("/api/jobs/<job_id>/patched")
+def download_patched(job_id: str):
+    """Download the patched binary produced by signature analysis."""
+    job = jobs.get(job_id)
+    if not job:
+        abort(404)
+    path = job.get("patched_file_path")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Patched file not available"}), 404
+    base     = os.path.splitext(job.get("filename", "file"))[0]
+    ext      = os.path.splitext(job.get("filename", "file"))[1]
+    dl_name  = f"{base}_patched{ext}"
+    return send_file(path, as_attachment=True, download_name=dl_name)
+
+
+@app.route("/api/jobs/<job_id>/yara")
+def download_yara(job_id: str):
+    """Download the YARA rules produced by signature analysis."""
+    job = jobs.get(job_id)
+    if not job:
+        abort(404)
+    path = job.get("yara_file_path")
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "YARA file not available"}), 404
+    base    = os.path.splitext(job.get("filename", "file"))[0]
+    dl_name = f"{base}_signatures.yar"
+    return send_file(path, as_attachment=True, download_name=dl_name)
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     _load_results_from_disk()
     print("=" * 60)
-    print("  Local Malware Sandbox")
+    print("  LocalScan — Malware Analysis Sandbox")
     print("  http://localhost:5000")
     print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
